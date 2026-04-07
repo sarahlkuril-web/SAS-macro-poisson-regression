@@ -26,9 +26,9 @@ and GLMM across four encounter subsets:
         SET &out;
         zcta5          = PUT(zcta5, 5.);
         month          = PUT(month, 2.);
-        pov_pct        = INPUT(pov_pct,        best12.);
-        public_ins_pct = INPUT(public_ins_pct,  best12.);
-        PM25_Mean      = INPUT(PM25_Mean,        best12.);
+        pov_pct        = INPUT(pov_pct, best12.);
+        public_ins_pct = INPUT(public_ins_pct, best12.);
+        PM25_Mean      = INPUT(PM25_Mean, best12.);
     RUN;
 
 %mend import_subset;
@@ -36,17 +36,16 @@ and GLMM across four encounter subsets:
 
 /* Import all 4 subsets */
 %import_subset(sheet=Asthma_IP, out=AIP);
-%import_subset(sheet=Asthma_OP, out=AOP);   /* FIX: removed space from sheet name */
-%import_subset(sheet=COPD_IP,   out=CIP);   /* FIX: removed space from sheet name */
-%import_subset(sheet=COPD_OP,   out=COP);   /* FIX: removed space from sheet name */
+%import_subset(sheet=Asthma_OP, out=AOP);
+%import_subset(sheet=COPD_IP,   out=CIP); 
+%import_subset(sheet=COPD_OP,   out=COP);
 
 
 /*----- STEP 2: MACRO FOR POISSON GLM -----*/
-/* FIX: Added ODS OUTPUT to capture parameter estimates for rr_summary */
 
-%macro run_poisson(data=, outcome=, offset=, covars=, outname=);
+%macro run_poisson_glm(data=, outcome=, offset=, covars=, outname=);
 
-    ODS OUTPUT ParameterEstimates = est_&outname;
+    ODS OUTPUT ParameterEstimates = est_&outname; /* ODS OUTPUT to capture parameter estimates for rr_summary */
 
     PROC GENMOD DATA=&data;
         MODEL &outcome = &covars / DIST=POISSON LINK=LOG OFFSET=&offset;
@@ -61,18 +60,17 @@ and GLMM across four encounter subsets:
     RUN;
     TITLE;   /* Clear title after each print */
 
-%mend run_poisson;
+%mend run_poisson_glm;
 
 
 /*----- STEP 3: MACRO FOR GLMM WITH RANDOM MONTH EFFECT -----*/
-/* FIX: Parameterized so it loops across all four subsets;
-        equivalent to glmmPQL in R (PROC GLIMMIX, method RSPL) */
+/* Macro loops across all four subsets */
 
-%macro run_glmm(data=, outcome=, offset=, covars=, outname=);
+%macro run_poisson_glmm(data=, outcome=, offset=, covars=, outname=);
 
     ODS OUTPUT ParameterEstimates = est_glmm_&outname;
 
-    PROC GLIMMIX DATA=&data METHOD=RSPL;
+    PROC GLIMMIX DATA=&data METHOD=RSPL; /* RSPL=Residual Pseudo-Likelihood, a default estimation method for non-normal data in GLMM */
         CLASS month;
         MODEL &outcome = &covars / DIST=POISSON LINK=LOG OFFSET=&offset SOLUTION;
         RANDOM INTERCEPT / SUBJECT=month;
@@ -81,7 +79,7 @@ and GLMM across four encounter subsets:
 
     ODS OUTPUT CLOSE;
 
-%mend run_glmm;
+%mend run_poisson_glmm;
 
 
 /*----- STEP 4: RUN GLM AND GLMM ACROSS ALL FOUR SUBSETS -----*/
@@ -94,7 +92,7 @@ and GLMM across four encounter subsets:
         %let ds = %scan(&subsets, &i);
 
         /* --- Poisson GLM --- */
-        %run_poisson(
+        %run_poisson_glm(
             data    = &ds,
             outcome = cases,
             offset  = log_pop,
@@ -103,7 +101,7 @@ and GLMM across four encounter subsets:
         );
 
         /* --- GLMM with random month effect --- */
-        %run_glmm(
+        %run_poisson_glmm(
             data    = &ds,
             outcome = cases,
             offset  = log_pop,
@@ -117,15 +115,19 @@ and GLMM across four encounter subsets:
 
 %run_all_subsets;
 
+/*-------------------------------------------------------------------------------------*/
+/*---------RECC END HERE, FOR STATISTICAL DIVERGENCE REASONS AS NOTED BELOW -----------*/
+/*-------------------------------------------------------------------------------------*/
+
+
 
 /*----- STEP 5: MORAN'S I (spatial autocorrelation check) -----*/
-/* Calls PROC IML to compute Moran's I from residuals + weights matrix.
-   FIX: Corrected S0 formula (sum of all elements of W);
-        added loop so this can be called per-subset residual dataset. */
+/* Calls PROC IML to compute Moran's I from residuals + pre-exported weights matrix from a CSV (k=10, great-circle distance)*/
 
 %macro morans_i(resid_data=, resid_var=, weights_csv=);
 
-    /* Load spatial weights matrix */
+    /* Load spatial weights (W) matrix */
+    /* This reads a CSV file containing pre-exported weights matrix using the 10 nearest neighbors (k=10, great-circle distance)*/
     PROC IMPORT DATAFILE="&weights_csv"
         OUT=wmat
         DBMS=CSV REPLACE;
@@ -134,6 +136,7 @@ and GLMM across four encounter subsets:
     PROC IML;
 
         /* Load residuals */
+        /* ZCTA-averaged residuals from the GLM */
         USE &resid_data;
             READ ALL VAR {&resid_var} INTO e;
         CLOSE &resid_data;
@@ -144,52 +147,58 @@ and GLMM across four encounter subsets:
         CLOSE wmat;
 
         n  = NROW(e);
-        S0 = SUM(W);           /* FIX: SUM(W) gives total of all weights */
+        S0 = SUM(W);           /* SUM(W) gives total of all weights */
 
-        ebar = e[:];
+        ebar = e[:];           /* Grand mean of residuals (scalar) */
         z    = e - ebar;
 
-        num = z` * W * z;      /* FIX: added transpose (z`) for conformability */
-        den = z` * z;
+        num = z` * W * z;      /* Transpose (z`) added for conformability
+                                  Numerator: spatial lag of mean-centered residuals. z` is the row transpose needed for matrix conformability (1 x n * n x n * n x 1 = scalar). */
+        den = z` * z;          /* Denominator: total sum of squares of z. */
 
-        I = (n / S0) * (num / den);
+        I = (n / S0) * (num / den);  /* Moran's I statistic. */
         PRINT "Moran's I statistic:" I;
 
     QUIT;
 
 %mend morans_i;
 
-/* Example calls — one per subset residual dataset */
+/* Run Moran's I for each subset using its GLM residual dataset. */
+
 %morans_i(
     resid_data  = glm_AIP,
     resid_var   = residuals,
     weights_csv = C:\Users\vivre\Documents\Dissertation\wmat.csv
 );
+/* AIP = Asthma Inpatient. Residuals sourced from glm_AIP output
+   dataset created in Step 2. Confirm row count matches n ZCTAs
+   in wmat.csv before interpreting I. */
 
 %morans_i(
     resid_data  = glm_AOP,
     resid_var   = residuals,
     weights_csv = C:\Users\vivre\Documents\Dissertation\wmat.csv
 );
+/* AOP = Asthma Outpatient. Same wmat assumed — revisit if the
+   outpatient ZCTA coverage differs from inpatient. */
 
 %morans_i(
     resid_data  = glm_CIP,
     resid_var   = residuals,
     weights_csv = C:\Users\vivre\Documents\Dissertation\wmat.csv
 );
+/* CIP = COPD Inpatient. */
 
 %morans_i(
     resid_data  = glm_COP,
     resid_var   = residuals,
     weights_csv = C:\Users\vivre\Documents\Dissertation\wmat.csv
 );
+/* COP = COPD Outpatient. */
 
 
 /*----- STEP 6: SUMMARIZE MODEL OUTPUT (Relative Risk + 95% CI) -----*/
-/* Works for parameter estimate datasets captured via ODS OUTPUT
-   from either PROC GENMOD or PROC GLIMMIX.
-   FIX: References est_glm_<subset> datasets created in Step 2,
-        not a hardcoded "glm_estimates" dataset. */
+/* Works for parameter estimate datasets captured via ODS OUTPUT from either PROC GENMOD or PROC GLIMMIX. */
 
 %macro rr_summary(param_data=, beta_var=, multiplier=1, outname=);
 
@@ -222,7 +231,7 @@ and GLMM across four encounter subsets:
 
     /* Raw RR (per 1-unit increase) */
     %rr_summary(
-        param_data = est_glm_&ds,
+        param_data = est_glm_&ds,    /* references est_glm_<subset> datasets created in Step 2 */
         beta_var   = Estimate,
         multiplier = 1,
         outname    = rr_raw_&ds
@@ -230,10 +239,18 @@ and GLMM across four encounter subsets:
 
     /* RR per 10-unit increase (e.g. PM2.5, temperature) */
     %rr_summary(
-        param_data = est_glm_&ds,
+        param_data = est_glm_&ds,  /* references est_glm_<subset> datasets created in Step 2 */
         beta_var   = Estimate,
         multiplier = 10,
         outname    = rr_x10_&ds
     );
 
 %end;
+
+/*NOTES: The most important methodological note to keep in mind: the R code constructs the weights matrix 
+on the fly using knearneigh(k=10, longlat=TRUE), which uses great-circle (Haversine) distances — appropriate 
+for lat/lon coordinates. The SAS version simply reads whatever CSV you give it, so the validity of the 
+comparison depends entirely on that CSV having been exported from the identical kNN specification in R via 
+something like listw2mat(lstwaip). If there's any mismatch in k, distance metric, or ZCTA ordering between 
+the two, the I statistics will diverge for reasons unrelated to the underlying spatial pattern. 
+Therefore, will run GLMM + Bayesian in R instead for analysis*/
