@@ -1,0 +1,84 @@
+/*----------------------------------------------------
+File Name: Asthma/COPD Exacerbation Analysis Pipeline
+Author: Sarah L. Kuril
+Project: Dissertation
+Description: Analytic macros for Poisson Regression GLM 
+and GLMM across four encounter subsets:
+    - Asthma Inpatient (AIP)
+    - Asthma Outpatient (AOP)
+    - COPD Inpatient (CIP)
+    - COPD Outpatient (COP)
+------------------------------------------------------*/
+
+
+/*----- STEP 1: LOAD DATA -----*/
+
+%macro import_subset(sheet=, out=);
+
+PROC IMPORT DATAFILE="C:\Users\vivre\Documents\Dissertation\pop_subset_rearranged.xlsx"
+    OUT=&out
+    DBMS=XLSX REPLACE;
+    SHEET="&sheet";
+RUN;
+
+/* Ensure correct variable formats */
+DATA &out;
+    SET &out;
+    zcta5          = PUT(zcta5, 5.);
+    month          = PUT(month, 2.);
+    pov_pct        = INPUT(pov_pct, best12.);
+    public_ins_pct = INPUT(public_ins_pct, best12.);
+    PM25_Mean      = INPUT(PM25_Mean, best12.);
+RUN;
+
+%mend import_subset;
+
+
+/* Import all 4 subsets */
+%import_subset(sheet=Asthma_IP, out=AIP);
+%import_subset(sheet=Asthma OP, out=AOP);
+%import_subset(sheet=COPD IP,   out=CIP);
+%import_subset(sheet=COPD OP,   out=COP);
+
+
+/*----- STEP 2: CREATE MACRO FOR BASIC POISSON REGRESSION -----*/
+
+%MACRO run_poisson(data=, outcome=, offset=, covars=, outname=); 
+
+PROC GENMOD DATA=&data; 
+  MODEL &outcome = &covars / DIST=POISSON LINK=LOG OFFSET=&offset; 
+  OUTPUT OUT=&outname RESRAW=residuals PRED=predicted; 
+RUN; 
+
+TITLE "Poisson Regression Residuals: &outname"; 
+PROC PRINT DATA=&outname (OBS=20); 
+VAR zcta5 &outcome predicted residuals; 
+RUN; 
+
+%MEND run_poisson;
+
+/*----- STEP 3: CALL ANALYTIC MACROS TO RUN ACROSS ALL FOUR SUBSETS -----*/
+
+%macro run_all_subsets;
+
+    %let subsets = AIP AOP CIP COP;
+
+    %do i = 1 %to 4;
+        %let ds = %scan(&subsets, &i);
+
+        %run_poisson(
+            data=&ds,
+            outcome=cases,
+            offset=log_pop,
+            covars=over64_pct pov_pct college_pct public_ins_pct tempmax_avg PM25_90pct,
+            outname=glm_&ds
+        );
+
+    %end;
+
+%mend;
+
+%run_all_subsets;
+
+
+MACRO 2: COMPUTE MORAN'S I (spatial autocorrelation check) This macro calls PROC IML to compute it from residuals + weights matrix ------------------------------------------------------------*/ %MACRO morans_i(resid_data=, resid_var=, weights_csv=); /* Load weights matrix */ PROC IMPORT DATAFILE="&weights_csv" OUT=wmat DBMS=CSV REPLACE; RUN; PROC IML; /* Load residuals */ USE &resid_data; READ ALL VAR {&resid_var} INTO e; CLOSE &resid_data; /* Load W matrix (assumes square, rows = cols = n ZCTAs) */ USE wmat; READ ALL INTO W; CLOSE wmat; n = NROW(e); S0 = e[+,]**0 * W[+,+]; /* sum of all weights */ ebar = e[:]; z = e - ebar; num = z * W * z; den = z * z; I = (n / S0) * (num / den); PRINT "Moran's I statistic:" I; QUIT; %MEND morans_i; /* Example call after macro run_poisson */ %morans_i( resid_data = glm_out, resid_var = residuals, weights_csv = C:\Users\vivre\Documents\Dissertation\wmat.csv ); /*------------------------------------------------------------ STEP 2: GLMM WITH RANDOM MONTH EFFECT Equivalent to glmmPQL in R (PROC GLIMMIX) ------------------------------------------------------------*/ PROC GLIMMIX DATA=mydata METHOD=RSPL; CLASS month; MODEL cases = pov_pct college_pct public_ins_pct tempmax_avg PM25_90pct / DIST=POISSON LINK=LOG OFFSET=log_pop SOLUTION; RANDOM INTERCEPT / SUBJECT=month; OUTPUT OUT=glmm_out RESID=residuals PRED=predicted; RUN; /*------------------------------------------------------------ MACRO 3: SUMMARIZE MODEL OUTPUT (Relative Risk + 95% CI) Equivalent to exp(beta.samples) quantile summary in R Works for any GENMOD or GLIMMIX output ------------------------------------------------------------*/ %MACRO rr_summary(param_data=, beta_var=, multiplier=1, outname=); DATA &outname; SET &param_data; /* Exponentiate to get relative risk */ RR = EXP(&beta_var * &multiplier); RR_LCL = EXP(LowerCL * &multiplier); RR_UCL = EXP(UpperCL * &multiplier); LABEL RR="Relative Risk" RR_LCL="95% LCL" RR_UCL="95% UCL"; RUN; TITLE "Relative Risk Summary: &outname (multiplier=&multiplier)"; PROC PRINT DATA=&outname LABEL NOOBS; VAR Parameter RR RR_LCL RR_UCL; RUN; %MEND rr_summary; /* Example: raw RR */ %rr_summary(param_data=glm_estimates, beta_var=Estimate, multiplier=1, outname=rr_raw); /* Example: per 10-unit increase */ %rr_summary(param_data=glm_estimates, beta_var=Estimate, multiplier=10, outname=rr_x10);
